@@ -1,0 +1,26 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "SnapAsk: 运行截图问答",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/snapask/main.py",
+      "cwd": "${workspaceFolder}/snapask",
+      "console": "integratedTerminal",
+      "justMyCode": false
+    },
+    {
+      "name": "SnapAsk: 冒烟测试(离屏)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/snapask/smoke_test.py",
+      "cwd": "${workspaceFolder}/snapask",
+      "console": "integratedTerminal",
+      "env": {
+        "QT_QPA_PLATFORM": "offscreen"
+      },
+      "justMyCode": false
+    }
+  ]
+}
