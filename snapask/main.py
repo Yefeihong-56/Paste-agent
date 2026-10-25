@@ -1,13 +1,14 @@
-"""SnapAsk 入口：托盘常驻 + F1 截图闭环（M1）。
+"""SnapAsk 入口：托盘常驻 + F1 截图闭环（M1.5：选区可调整）。
 
 运行：python main.py
-流程：F1 -> 多屏遮罩框选 -> 松开即自动复制剪贴板 -> 迷你工具栏（保存/问AI占位/完成）
+流程：F1 -> 多屏遮罩框选 -> 松开进入调整态（移动/8向缩放，工具栏出现）
+      -> 双击/Enter/"完成"确认 -> 自动复制剪贴板 -> 工具栏可保存
 """
 import os
 import sys
 
 from PySide6.QtCore import QObject, QRect, Qt, Signal
-from PySide6.QtGui import QAction, QColor, QGuiApplication, QIcon, QPainter, QPixmap
+from PySide6.QtGui import QAction, QColor, QFont, QGuiApplication, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
 import config
@@ -23,10 +24,9 @@ def _make_icon() -> QIcon:
     pix.fill(QColor(0x18, 0x5F, 0xA5))
     painter = QPainter(pix)
     painter.setPen(QColor(0xFF, 0xFF, 0xFF))
-    from PySide6.QtGui import QFont
     font = QFont()
     font.setPixelSize(20)
-    font.setWeight(500)
+    font.setWeight(QFont.Weight.Medium)  # Medium = 500；PySide6 6.x 起只接受枚举
     painter.setFont(font)
     painter.drawText(QRect(0, 0, 32, 32), Qt.AlignmentFlag.AlignCenter, "S")
     painter.end()
@@ -44,6 +44,7 @@ class AppController(QObject):
         self.cfg = cfg
         self._capturing = False
         self._overlays: list[ov.SelectionOverlay] = []
+        self._active_overlay: ov.SelectionOverlay | None = None
         self._toolbar: tb.MiniToolbar | None = None
         self._last_pixmap: QPixmap | None = None
         self.bridge = HotkeyBridge()
@@ -54,10 +55,15 @@ class AppController(QObject):
         if self._capturing:
             return
         self._capturing = True
+        self._close_toolbar()
         self._overlays = []
+        self._active_overlay = None
         for screen in QGuiApplication.screens():
             shot = ov.grab_screen(screen)
             w = ov.SelectionOverlay(screen, shot)
+            w.locked.connect(self._on_locked)
+            w.changed.connect(self._on_changed)
+            w.drafting.connect(self._on_drafting)
             w.finished.connect(self._on_finished)
             w.cancelled.connect(self._on_cancelled)
             self._overlays.append(w)
@@ -66,31 +72,84 @@ class AppController(QObject):
         for w in self._overlays:
             w.close()
         self._overlays = []
+        self._active_overlay = None
         self._capturing = False
 
+    # ---- 选区状态 ----
+    def _on_locked(self, rect: QRect):
+        """松开鼠标：选区冻结进入调整态；关闭其他屏遮罩，弹出工具栏。"""
+        w = self.sender()
+        self._active_overlay = w
+        for o in self._overlays:
+            if o is not w:
+                o.close()
+        self._overlays = [w]
+        self._show_toolbar(w, rect)
+
+    def _on_drafting(self):
+        """调整态中在选区外按下：重新框选，先收起工具栏。"""
+        self._close_toolbar()
+
+    def _on_changed(self, rect: QRect):
+        """选区移动/缩放：工具栏跟随。"""
+        w = self.sender()
+        if self._toolbar is not None and self._active_overlay is w:
+            screen_geo = w.screen().geometry()
+            anchor = QRect(screen_geo.topLeft() + rect.topLeft(), rect.size())
+            self._toolbar.reposition(anchor, screen_geo)
+            self._toolbar.refresh()
+
     def _on_finished(self, rect: QRect):
+        """确认选区：复制剪贴板，关闭遮罩，保留工具栏供保存。"""
         w = self.sender()
         pixmap = w.shot.crop_logical_rect(rect)
         self._last_pixmap = pixmap
-        screen_geo = w.screen().geometry()
-        anchor = QRect(screen_geo.topLeft() + rect.topLeft(), rect.size())
-        self._close_overlays()
         if self.cfg.get("auto_copy_clipboard", True):
             storage.copy_to_clipboard(pixmap)
-        self._toolbar = tb.MiniToolbar(anchor, screen_geo)
-        self._toolbar.save_requested.connect(self._on_save)
-        self._toolbar.show()
+        self._close_overlays()
+        if self._toolbar is not None:
+            self._toolbar.refresh()
 
     def _on_cancelled(self):
         self._close_overlays()
+        self._close_toolbar()
 
-    def _on_save(self):
-        if self._last_pixmap is None:
-            return
-        path = storage.save_pixmap(self._last_pixmap, self.cfg["save_dir"])
-        self.tray.showMessage("SnapAsk", f"已保存：{path}", msecs=3000)
+    # ---- 工具栏 ----
+    def _show_toolbar(self, overlay: ov.SelectionOverlay, rect: QRect):
+        screen_geo = overlay.screen().geometry()
+        anchor = QRect(screen_geo.topLeft() + rect.topLeft(), rect.size())
         if self._toolbar is not None:
             self._toolbar.close()
+        self._toolbar = tb.MiniToolbar(anchor, screen_geo)
+        self._toolbar.confirm_requested.connect(self._on_confirm)
+        self._toolbar.save_requested.connect(self._on_save)
+        self._toolbar.closed.connect(self._on_toolbar_closed)
+        self._toolbar.show()
+
+    def _on_toolbar_closed(self):
+        self._toolbar = None
+
+    def _on_confirm(self):
+        if self._active_overlay is not None and self._active_overlay.is_adjusting():
+            self._active_overlay.confirm()
+
+    def _on_save(self):
+        w = self._active_overlay
+        pixmap = None
+        if w is not None and w.is_adjusting():
+            pixmap = w.shot.crop_logical_rect(w.current_rect())
+        elif self._last_pixmap is not None:
+            pixmap = self._last_pixmap
+        if pixmap is None:
+            return
+        path = storage.save_pixmap(pixmap, self.cfg["save_dir"])
+        self.tray.showMessage("SnapAsk", f"已保存：{path}", msecs=3000)
+        self._close_toolbar()
+
+    def _close_toolbar(self):
+        if self._toolbar is not None:
+            self._toolbar.close()
+            self._toolbar = None
 
     # ---- 托盘与生命周期 ----
     def setup_tray(self, app: QApplication):
