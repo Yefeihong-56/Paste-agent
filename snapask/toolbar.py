@@ -10,6 +10,7 @@ from PySide6.QtWidgets import QHBoxLayout, QPushButton, QWidget
 class MiniToolbar(QWidget):
     save_requested = Signal()
     confirm_requested = Signal()   # "完成"：确认当前选区
+    ask_requested = Signal()       # "问 AI"：打开问答面板（M2）
     closed = Signal()
 
     _AUTO_HIDE_MS = 8000  # 无交互自动收起
@@ -31,8 +32,8 @@ class MiniToolbar(QWidget):
         self.btn_save = QPushButton("保存")
         self.btn_save.clicked.connect(self.save_requested)
         self.btn_ask = QPushButton("问 AI")
-        self.btn_ask.setEnabled(False)  # M2 接入问答后启用
-        self.btn_ask.setToolTip("截图问答功能将在 M2 上线")
+        self.btn_ask.setToolTip("针对当前截图向千问提问")
+        self.btn_ask.clicked.connect(self.ask_requested)
         self.btn_close = QPushButton("关闭")
         self.btn_close.clicked.connect(self.close)
         for b in (self.btn_confirm, self.btn_save, self.btn_ask, self.btn_close):

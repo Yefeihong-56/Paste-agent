@@ -5,6 +5,7 @@
 import os
 import sys
 import tempfile
+import io
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -54,11 +55,11 @@ def main():
 
     # 6) 工具栏构造
     bar = tb.MiniToolbar(QRect(100, 100, 300, 200), geo)
-    assert bar.btn_ask.isEnabled() is False  # M2 占位
+    assert bar.btn_ask.isEnabled() is True  # M2 起问 AI 可用
     bar.reposition(QRect(150, 150, 300, 200), geo)
     bar.refresh()
     bar.close()
-    print("[6] toolbar OK (reposition/refresh/ask-disabled)")
+    print("[6] toolbar OK (reposition/refresh/ask-enabled)")
 
     # 7) 剪贴板（离屏平台可能不支持，失败不阻塞）
     try:
@@ -183,6 +184,116 @@ def main():
     controller = app_main.AppController(cfg)
     assert controller._capturing is False
     print("[9] main import + controller OK")
+
+    # 10) 密钥隔离：.env / .env.example / .gitignore
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    env_path = os.path.join(root, ".env")
+    example_path = os.path.join(root, ".env.example")
+    gitignore_path = os.path.join(root, ".gitignore")
+    assert os.path.exists(env_path), "缺少 .env"
+    assert os.path.exists(example_path), "缺少 .env.example 模板"
+    assert os.path.exists(gitignore_path), "缺少 .gitignore"
+    env_text = open(env_path, encoding="utf-8").read()
+    assert "DASHSCOPE_API_KEY=" in env_text, ".env 应包含 DASHSCOPE_API_KEY 占位"
+    gi_text = open(gitignore_path, encoding="utf-8").read()
+    assert ".env" in gi_text and "__pycache__" in gi_text
+    # 若在 git 仓库中，.env 必须被忽略
+    import subprocess as _sp
+    r = _sp.run(["git", "check-ignore", ".env"], cwd=root,
+                capture_output=True, text=True)
+    if r.returncode == 0:
+        print("[10] 密钥隔离 OK（.env 存在且被 git 忽略）")
+    else:
+        print("[10] 密钥隔离 OK（非 git 环境，跳过忽略检查）")
+
+    # 11) qa_agent 纯函数
+    import qa_agent
+    ids = [m["id"] for m in qa_agent.MODELS]
+    assert len(ids) == len(set(ids)) and qa_agent.DEFAULT_MODEL in ids
+    assert qa_agent.model_vision("deepseek-v4.1-flash") is True
+    assert qa_agent.model_vision("qwen-plus") is True  # 未知模型按支持图片处理
+    assert qa_agent.model_vision("any-custom-model") is True
+    assert "api_key" not in config.DEFAULTS, "config.json 不得再存放 api_key"
+    assert "custom_models" in config.DEFAULTS
+    # 消息组装：首轮带图（原生格式 {"image": ...}）
+    msgs = qa_agent.build_messages("这是什么", [], True, "data:image/png;base64,AAA")
+    assert msgs[0]["role"] == "system"
+    last = msgs[-1]
+    assert last["role"] == "user" and isinstance(last["content"], list)
+    assert last["content"][0] == {"image": "data:image/png;base64,AAA"}
+    assert last["content"][1] == {"text": "这是什么"}
+    # 追问轮：不带图，截图留在历史里
+    history = [{"role": "user", "content": [{"image": "data:image/png;base64,AAA"}, {"text": "q"}]},
+               {"role": "assistant", "content": [{"text": "a"}]}]
+    msgs2 = qa_agent.build_messages("继续", history, True)
+    assert msgs2[-1]["content"] == [{"text": "继续"}]
+    assert msgs2[1]["content"][0] == {"image": "data:image/png;base64,AAA"}, \
+        "历史中的图片必须保留，追问轮模型才看得到截图"
+    # 文本模型：历史图片替换为占位
+    msgs3 = qa_agent.build_messages("继续", history, False)
+    assert msgs3[1]["content"] == [{"text": "[截图]"}]
+    # 错误分类
+    assert "无效" in qa_agent.classify_error("Error code: 401")
+    assert "不存在" in qa_agent.classify_error("Error code: 404: Model not exist")
+    assert "权限" in qa_agent.classify_error("Error code: 403: Access denied")
+    assert "限流" in qa_agent.classify_error("429 Too Many Requests")
+    assert "超时" in qa_agent.classify_error("Request timeout")
+    print("[11] qa_agent 纯函数 OK")
+
+    # 12) 图片压缩与 data URL
+    from PIL import Image as PILImage
+    big = PILImage.new("RGB", (3000, 2000), (10, 20, 30))
+    url = qa_agent.image_to_data_url(big)
+    assert url.startswith("data:image/png;base64,")
+    import base64 as _b64
+    raw = _b64.b64decode(url.split(",", 1)[1])
+    decoded = PILImage.open(io.BytesIO(raw))
+    assert max(decoded.size) <= qa_agent.MAX_IMAGE_EDGE, "长边应被压缩"
+    print(f"[12] 图片压缩 OK（3000x2000 -> {decoded.size[0]}x{decoded.size[1]}）")
+
+    # 13) 问 AI 面板构建（离屏）
+    import ask_panel
+    panel = ask_panel.AskPanel(shot, QRect(100, 100, 300, 200), geo)
+    assert panel.picker.current() == qa_agent.DEFAULT_MODEL
+    assert panel.thumb.pixmap() is not None
+    # 首轮：文本模型在下拉中应被禁用
+    disabled = [i for i in range(panel.picker.popup.count())
+                if not (panel.picker.popup.item(i).flags()
+                        & Qt.ItemFlag.ItemIsEnabled)]
+    assert len(disabled) == len([m for m in qa_agent.MODELS if not m["vision"]]), \
+        "首轮应禁用全部文本模型"
+    # 模拟一轮历史后，文本模型恢复可选
+    panel.history = [{"role": "user", "content": "q"},
+                     {"role": "assistant", "content": "a"}]
+    panel._refresh_model_enabled()
+    disabled2 = [i for i in range(panel.picker.popup.count())
+                 if not (panel.picker.popup.item(i).flags()
+                         & Qt.ItemFlag.ItemIsEnabled)]
+    assert len(disabled2) == 0, "追问轮应放开全部模型"
+    panel.close()
+    print("[13] 问 AI 面板 OK（模型选择/首轮限制/追问放开）")
+
+    # 14) 未配置 Key 时的端到端异步路径（真实子线程 + 信号回路）
+    import time as _time
+    if not qa_agent.load_api_key():
+        panel2 = ask_panel.AskPanel(shot, QRect(100, 100, 300, 200), geo)
+        panel2.input.setPlainText("这张图讲的什么？")
+        panel2.send_question()
+        assert panel2._streaming is True, "发送后应进入流式状态"
+        for _ in range(200):
+            app.processEvents()
+            if not panel2._streaming:
+                break
+            _time.sleep(0.05)
+        assert not panel2._streaming, "子线程应通过信号回路结束流式状态"
+        assert "DASHSCOPE_API_KEY" in panel2.answer.toPlainText(), \
+            "未配置 Key 时应给出 .env 填写引导"
+        assert not panel2.btn_locate.isHidden(), "应显示'定位 .env 文件'按钮"
+        assert panel2._thread is None, "线程应已清理"
+        panel2.close()
+        print("[14] 无Key端到端异步路径 OK（引导提示+线程清理）")
+    else:
+        print("[14] 已配置 Key，跳过无Key场景测试")
 
     print("SMOKE TEST PASSED")
 

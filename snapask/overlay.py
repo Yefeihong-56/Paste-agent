@@ -54,13 +54,17 @@ class ScreenShot:
 
     def crop_logical_rect(self, rect: QRect) -> QPixmap:
         """按逻辑坐标矩形裁剪，返回 1:1 物理像素 QPixmap。"""
+        return _pil_to_qpixmap(self.crop_pil_logical(rect))
+
+    def crop_pil_logical(self, rect: QRect) -> PIL.Image.Image:
+        """按逻辑坐标矩形裁剪，返回 PIL 图像（供 LLM 编码/压缩使用）。"""
         d = self.dpr
         box = (
             round(rect.x() * d), round(rect.y() * d),
             round((rect.x() + rect.width()) * d),
             round((rect.y() + rect.height()) * d),
         )
-        return _pil_to_qpixmap(self.pil_image.crop(box))
+        return self.pil_image.crop(box)
 
 
 def grab_screen(qscreen) -> ScreenShot:

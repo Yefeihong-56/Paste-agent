@@ -5,6 +5,7 @@
       -> 双击/Enter/"完成"确认 -> 自动复制剪贴板 -> 工具栏可保存
 """
 import os
+import subprocess
 import sys
 
 from PySide6.QtCore import QObject, QRect, Qt, Signal
@@ -14,6 +15,8 @@ from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 import config
 import hotkey as hk
 import overlay as ov
+import qa_agent
+import ask_panel
 import storage
 import toolbar as tb
 
@@ -47,6 +50,10 @@ class AppController(QObject):
         self._active_overlay: ov.SelectionOverlay | None = None
         self._toolbar: tb.MiniToolbar | None = None
         self._last_pixmap: QPixmap | None = None
+        self._last_shot: ov.ScreenShot | None = None
+        self._last_rect: QRect | None = None
+        self._last_screen_geo: QRect | None = None
+        self._panel: ask_panel.AskPanel | None = None
         self.bridge = HotkeyBridge()
         self.bridge.triggered.connect(self.start_capture)
 
@@ -55,6 +62,7 @@ class AppController(QObject):
         if self._capturing:
             return
         self._capturing = True
+        self._close_panel()      # 新截图 = 新会话
         self._close_toolbar()
         self._overlays = []
         self._active_overlay = None
@@ -80,6 +88,9 @@ class AppController(QObject):
         """松开鼠标：选区冻结进入调整态；关闭其他屏遮罩，弹出工具栏。"""
         w = self.sender()
         self._active_overlay = w
+        self._last_shot = w.shot
+        self._last_rect = QRect(rect)
+        self._last_screen_geo = w.screen().geometry()
         for o in self._overlays:
             if o is not w:
                 o.close()
@@ -100,10 +111,13 @@ class AppController(QObject):
             self._toolbar.refresh()
 
     def _on_finished(self, rect: QRect):
-        """确认选区：复制剪贴板，关闭遮罩，保留工具栏供保存。"""
+        """确认选区：复制剪贴板，关闭遮罩，保留工具栏供保存/问 AI。"""
         w = self.sender()
         pixmap = w.shot.crop_logical_rect(rect)
         self._last_pixmap = pixmap
+        self._last_shot = w.shot
+        self._last_rect = QRect(rect)
+        self._last_screen_geo = w.screen().geometry()
         if self.cfg.get("auto_copy_clipboard", True):
             storage.copy_to_clipboard(pixmap)
         self._close_overlays()
@@ -123,11 +137,34 @@ class AppController(QObject):
         self._toolbar = tb.MiniToolbar(anchor, screen_geo)
         self._toolbar.confirm_requested.connect(self._on_confirm)
         self._toolbar.save_requested.connect(self._on_save)
+        self._toolbar.ask_requested.connect(self._on_ask)
         self._toolbar.closed.connect(self._on_toolbar_closed)
         self._toolbar.show()
 
     def _on_toolbar_closed(self):
         self._toolbar = None
+
+    # ---- 问 AI 面板（M2）----
+    def _on_ask(self):
+        # 若仍在调整态，先按当前选区确认（同步触发 _on_finished：复制剪贴板）
+        w = self._active_overlay
+        if w is not None and w.is_adjusting():
+            w.confirm()
+        shot, rect = self._last_shot, self._last_rect
+        if shot is None or rect is None or self._last_screen_geo is None:
+            return
+        self._close_panel()
+        self._panel = ask_panel.AskPanel(shot, rect, self._last_screen_geo)
+        self._panel.closed.connect(self._on_panel_closed)
+        self._panel.show()
+
+    def _on_panel_closed(self):
+        self._panel = None
+
+    def _close_panel(self):
+        if self._panel is not None:
+            self._panel.close()
+            self._panel = None
 
     def _on_confirm(self):
         if self._active_overlay is not None and self._active_overlay.is_adjusting():
@@ -159,10 +196,13 @@ class AppController(QObject):
         act_cap.triggered.connect(self.start_capture)
         act_dir = QAction("打开保存目录")
         act_dir.triggered.connect(self._open_save_dir)
+        act_key = QAction("配置 API Key（.env）")
+        act_key.triggered.connect(self._locate_env)
         act_quit = QAction("退出")
         act_quit.triggered.connect(app.quit)
         menu.addAction(act_cap)
         menu.addAction(act_dir)
+        menu.addAction(act_key)
         menu.addSeparator()
         menu.addAction(act_quit)
         self.tray.setContextMenu(menu)
@@ -179,6 +219,12 @@ class AppController(QObject):
 
     def _open_save_dir(self):
         os.startfile(self.cfg["save_dir"])
+
+    def _locate_env(self):
+        """在资源管理器中定位 .env（不存在则从模板创建），引导用户填 Key。"""
+        path = qa_agent.ensure_env_file()
+        if os.path.exists(path):
+            subprocess.run(["explorer", "/select," + path])
 
     def start_hotkey(self):
         self.listener = hk.start_listener(self.cfg["hotkey"], self.bridge.triggered.emit)

@@ -4,5 +4,6 @@
   "files.exclude": {
     "**/__pycache__": true,
     "**/*.pyc": true
-  }
+  },
+  "python.terminal.useEnvFile": true
 }
